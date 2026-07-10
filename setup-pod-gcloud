@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Install gcloud CLI + gcdn on a RunPod pod with auth creds from local Mac.
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+setup-pod-gcloud — set up gcloud CLI + gcdn on a remote RunPod pod
+
+Copies local gcloud credentials, installs gcloud CLI and gcdn (CDN-accelerated
+GCS download wrapper), configures auth, and runs a health check.
+
+Usage:
+  setup-pod-gcloud HOST PORT
+  setup-pod-gcloud --help
+
+Arguments:
+  HOST    Pod SSH host (IP or hostname from RunPod UI)
+  PORT    Pod SSH port (from RunPod UI)
+
+Examples:
+  setup-pod-gcloud 213.173.105.96 10940
+  setup-pod-gcloud 195.26.255.30 22188
+
+What it does:
+  1. Copies ~/.config/gcloud/{application_default_credentials.json,credentials.db,
+     access_tokens.db} to the pod (whichever exist locally)
+  2. Installs gcloud CLI if not present (to /tmp/google-cloud-sdk)
+  3. Configures gcloud to use the copied credentials
+  4. Installs gcdn binary to /usr/local/bin/gcdn
+  5. Runs gcdn init to fetch the CDN signing key
+  6. Prints a summary of what passed/failed
+
+Prerequisites:
+  - SSH key at ~/.ssh/id_ed25519 (used for all connections)
+  - Local gcloud credentials (run 'gcloud auth application-default login' first)
+  - Pod must be running and SSH-reachable
+
+Notes:
+  - Safe to re-run (idempotent) — skips already-installed components
+  - SSH host/port change every pod session — get them from the RunPod UI
+EOF
+  exit 0
+}
+
+[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && usage
+
+HOST="${1:?Usage: setup-pod-gcloud HOST PORT (try --help)}"
+PORT="${2:?Usage: setup-pod-gcloud HOST PORT (try --help)}"
+KEY="${HOME}/.ssh/id_ed25519"
+
+fail() { echo "FATAL: $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+
+# Preflight validation
+[[ "$PORT" =~ ^[0-9]+$ ]] || fail "PORT must be numeric, got '$PORT'"
+(( PORT >= 1 && PORT <= 65535 )) || fail "PORT out of range: $PORT"
+[[ -r "$KEY" ]] || fail "SSH key not readable: $KEY"
+
+SSH=(ssh -p "$PORT" -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@${HOST}")
+SCP=(scp -P "$PORT" -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+
+# 1. Test SSH connectivity
+step "Testing SSH to ${HOST}:${PORT}"
+if ! "${SSH[@]}" 'echo "SSH OK: $(hostname)"' 2>&1; then
+  fail "Cannot SSH to ${HOST}:${PORT} — check host/port and that the pod is running"
+fi
+
+# 2. Copy creds (only copy files that exist locally)
+step "Copying gcloud creds to ${HOST}:${PORT}"
+"${SSH[@]}" 'mkdir -p /root/.config/gcloud && chmod 700 /root/.config/gcloud' \
+  || fail "Failed to create /root/.config/gcloud on pod"
+
+cred_files=()
+for f in application_default_credentials.json credentials.db access_tokens.db; do
+  if [[ -f ~/.config/gcloud/$f ]]; then
+    cred_files+=("$HOME/.config/gcloud/$f")
+    echo "  found: $f"
+  else
+    echo "  skip (not found locally): $f"
+  fi
+done
+[[ ${#cred_files[@]} -eq 0 ]] && fail "No gcloud credential files found in ~/.config/gcloud/"
+
+if ! "${SCP[@]}" "${cred_files[@]}" "root@${HOST}:/root/.config/gcloud/"; then
+  fail "SCP failed — could not copy credentials to pod"
+fi
+"${SSH[@]}" 'chmod 600 /root/.config/gcloud/*.json /root/.config/gcloud/*.db 2>/dev/null; true'
+echo "  credentials copied and permissions set"
+
+# 3. Install gcloud + gcdn + configure creds
+step "Installing gcloud CLI + gcdn on pod"
+"${SSH[@]}" 'bash -s' <<'REMOTE'
+set -uo pipefail
+
+fail() { echo "FATAL (remote): $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+ok()   { echo "  OK: $*"; }
+warn() { echo "  WARNING: $*"; }
+
+# --- gcloud ---
+step "gcloud CLI"
+if command -v gcloud &>/dev/null; then
+  ok "already installed: $(gcloud version 2>&1 | head -1)"
+else
+  workdir=$(mktemp -d) || fail "mktemp failed"
+  cd "$workdir"
+  echo "  downloading gcloud CLI..."
+  if ! wget -q --show-progress --timeout=60 \
+    https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz; then
+    fail "wget gcloud tarball failed — check network"
+  fi
+  echo "  extracting..."
+  if ! tar -xf google-cloud-cli-linux-x86_64.tar.gz; then
+    fail "tar extract failed — corrupted download?"
+  fi
+  if ! ./google-cloud-sdk/install.sh --quiet --path-update true --command-completion true; then
+    fail "gcloud install.sh failed"
+  fi
+  export PATH="$workdir/google-cloud-sdk/bin:$PATH"
+  echo "export PATH=\"$workdir/google-cloud-sdk/bin:\$PATH\"" >> ~/.bashrc
+  rm -f google-cloud-cli-linux-x86_64.tar.gz
+  ok "installed: $(gcloud version 2>&1 | head -1)"
+fi
+
+export PATH="/tmp/google-cloud-sdk/bin:$PATH"
+
+# --- gcloud auth ---
+step "Configuring gcloud auth"
+export GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+grep -q GOOGLE_APPLICATION_CREDENTIALS ~/.bashrc 2>/dev/null || \
+  echo 'export GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json' >> ~/.bashrc
+
+acct=$(gcloud auth list --format='value(account)' 2>/dev/null | head -1)
+if [[ -n "$acct" ]]; then
+  gcloud config set account "$acct" 2>/dev/null
+  ok "active account: $acct"
+else
+  warn "no account found in credentials.db"
+fi
+
+echo "  ADC check..."
+if gcloud auth application-default print-access-token &>/dev/null; then
+  ok "ADC token valid"
+else
+  warn "ADC token expired — re-auth locally: gcloud auth application-default login"
+fi
+
+# --- gcdn ---
+step "gcdn (CDN-accelerated GCS downloads)"
+if command -v gcdn &>/dev/null; then
+  ok "already installed: $(gcdn version 2>&1)"
+else
+  echo "  downloading gcdn..."
+  if ! wget -q --show-progress --timeout=30 -O /usr/local/bin/gcdn \
+    https://storage.googleapis.com/aftershoot-assets-stage/aftershootco/gcloud-cdn-wrapper/latest/linux-amd64/gcdn; then
+    rm -f /usr/local/bin/gcdn
+    fail "wget gcdn failed — check network"
+  fi
+  chmod +x /usr/local/bin/gcdn
+  ok "installed: $(gcdn version 2>&1)"
+fi
+
+echo "  initializing gcdn (fetching CDN signing key)..."
+if gcdn init 2>&1; then
+  ok "gcdn init succeeded"
+else
+  warn "gcdn init failed — run 'gcdn init' manually on the pod"
+fi
+
+# --- Summary ---
+step "Setup summary"
+errors=0
+command -v gcloud &>/dev/null && ok "gcloud: installed" || { warn "gcloud: NOT FOUND"; errors=$((errors+1)); }
+command -v gcdn &>/dev/null  && ok "gcdn: installed"  || { warn "gcdn: NOT FOUND"; errors=$((errors+1)); }
+[[ -f /root/.config/gcloud/application_default_credentials.json ]] && ok "ADC file: present" || { warn "ADC file: MISSING"; errors=$((errors+1)); }
+gcloud auth application-default print-access-token &>/dev/null && ok "ADC token: valid" || { warn "ADC token: EXPIRED"; errors=$((errors+1)); }
+[[ -f /root/.config/gcdn/key ]] && ok "gcdn key: present" || { warn "gcdn key: MISSING"; errors=$((errors+1)); }
+
+if [[ $errors -gt 0 ]]; then
+  echo ""
+  echo "  $errors issue(s) detected — see warnings above"
+else
+  echo ""
+  echo "  All checks passed"
+fi
+REMOTE
+
+rc=$?
+echo ""
+if [[ $rc -eq 0 ]]; then
+  echo "Done. gcloud + gcdn + creds ready on ${HOST}:${PORT}"
+else
+  echo "FAILED (exit $rc). Check errors above." >&2
+  exit $rc
+fi
