@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Check local gcloud / ADC / GitHub creds and re-login (one browser flow) when they have expired.
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+creds-keeper — keep local gcloud, ADC and GitHub logins working
+
+Usage:
+  creds-keeper              check and print status (exit 1 if anything is expired)
+  creds-keeper --fix        check, then re-login whatever expired (opens a browser)
+  creds-keeper --notify     check silently; macOS notification if anything expired
+  creds-keeper --install-agent    run '--notify' every 30 min via launchd
+  creds-keeper --uninstall-agent
+
+Why this can't be fully automatic:
+  Your Workspace reauth policy expires logins periodically and the sign-in has to
+  be done by you. This script only detects expiry early and makes the fix one step
+  ('gcloud auth login --update-adc' refreshes gcloud login + ADC in one flow).
+  Pods get creds copied from here, so run this (or --fix) before setup-pod-claude.
+EOF
+  exit 0
+}
+
+LABEL=com.vivek.creds-keeper
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+mode=check
+case "${1:-}" in
+  -h|--help) usage ;;
+  --fix) mode=fix ;;
+  --notify) mode=notify ;;
+  --install-agent)
+    mkdir -p "$(dirname "$PLIST")"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$SELF</string><string>--notify</string></array>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/bin:$HOME/google-cloud-sdk/bin</string></dict>
+</dict></plist>
+EOF
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" && echo "agent installed: checks every 30 min ($PLIST)"
+    exit $? ;;
+  --uninstall-agent)
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null; rm -f "$PLIST"; echo "agent removed"; exit 0 ;;
+  "") ;;
+  *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
+esac
+
+say() { [[ $mode == notify ]] || echo "$@"; }
+
+gcloud_ok=1 adc_ok=1 gh_ok=1
+gcloud auth print-access-token &>/dev/null || gcloud_ok=0
+gcloud auth application-default print-access-token &>/dev/null || adc_ok=0
+if command -v gh &>/dev/null; then gh api user &>/dev/null || gh_ok=0; fi
+
+report() { say "  $([[ $2 == 1 ]] && echo 'ok     ' || echo 'EXPIRED') $1"; }
+report "gcloud login" $gcloud_ok
+report "gcloud ADC  " $adc_ok
+command -v gh &>/dev/null && report "GitHub (gh)" $gh_ok
+
+expired=()
+(( gcloud_ok )) || expired+=("gcloud login")
+(( adc_ok ))    || expired+=("gcloud ADC")
+(( gh_ok ))     || expired+=("GitHub")
+
+if (( ${#expired[@]} == 0 )); then
+  say "All local creds valid."
+  exit 0
+fi
+
+case $mode in
+  notify)
+    msg="Expired: ${expired[*]}. Run: creds-keeper --fix"
+    osascript -e "display notification \"$msg\" with title \"Credentials expired\"" 2>/dev/null
+    exit 1 ;;
+  fix)
+    if (( ! gcloud_ok && ! adc_ok )); then
+      echo; echo "==> gcloud auth login --update-adc (one flow for login + ADC)"
+      gcloud auth login --update-adc || echo "  gcloud login failed"
+    else
+      (( gcloud_ok )) || { echo; echo "==> gcloud auth login"; gcloud auth login; }
+      (( adc_ok ))    || { echo; echo "==> gcloud auth application-default login"; gcloud auth application-default login; }
+    fi
+    (( gh_ok )) || { echo; echo "==> gh auth login"; gh auth login -h github.com -w; }
+    echo; echo "Re-checking..."
+    exec "$0" ;;
+  *)
+    echo; echo "Run 'creds-keeper --fix' to re-login."
+    exit 1 ;;
+esac

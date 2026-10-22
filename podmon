@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# One tmux window with every training-health view. Installed on pods by setup-pod-claude.
+#
+#   podmon [LOGFILE]     LOGFILE is tailed in the bottom-left pane (default: nvidia-smi dmon)
+#   podmon --kill        close the dashboard session
+#   podmon --disk        one frame of the disk pane (used internally)
+#
+# Layout:
+#   +-------------------+-------------------+
+#   | nvtop (GPUs)      | htop (CPU/RAM)    |
+#   +-------------------+-------------------+
+#   | log tail / dmon   | disk space + I/O  |
+#   +-------------------+-------------------+
+# Mouse works (click a pane, scroll). Detach with Ctrl-b d; the session keeps running, re-run podmon to re-attach.
+set -uo pipefail
+S=podmon
+
+[[ "${1:-}" == "--kill" ]] && { tmux kill-session -t "$S" 2>/dev/null; echo "podmon closed"; exit 0; }
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+if [[ "${1:-}" == "--disk" ]]; then   # one frame of the disk pane (run under watch)
+  df -h /root /dev/shm 2>/dev/null
+  echo
+  iostat -dxz 1 2 2>/dev/null | awk '/^Device/{n++} n==2'
+  exit 0
+fi
+command -v tmux &>/dev/null || { echo "tmux not installed (apt-get install -y tmux)" >&2; exit 1; }
+
+if ! tmux has-session -t "$S" 2>/dev/null; then
+  LOG="${1:-}"
+  if [[ -n "$LOG" ]]; then
+    LEFT_BOTTOM="echo 'tail -F $LOG'; tail -n 200 -F '$LOG'"
+  else
+    LEFT_BOTTOM="nvidia-smi dmon -s pucm"   # power/temp, utilization, clocks, memory
+  fi
+  DISK="watch -t -n 2 '$(readlink -f "$0" 2>/dev/null || echo "$0") --disk'"
+
+  tmux new-session -d -s "$S" -n mon "nvtop"
+  tmux set-option -t "$S" mouse on
+  tmux set-option -t "$S" status-right "#H  %H:%M"
+  tmux split-window -h -t "$S:mon.0" "htop"
+  tmux split-window -v -t "$S:mon.1" "$DISK"
+  tmux split-window -v -t "$S:mon.0" "$LEFT_BOTTOM"
+  tmux select-pane -t "$S:mon.0"
+fi
+
+[[ -n "${PODMON_NOATTACH:-}" ]] && exit 0
+exec tmux attach -t "$S"

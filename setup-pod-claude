@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# Install Claude Code on a RunPod pod and authenticate it using creds from local Mac.
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+setup-pod-claude — install + authenticate Claude Code on a remote RunPod pod
+
+Usage:
+  setup-pod-claude HOST PORT
+  setup-pod-claude ssh root@HOST -p PORT -i ~/.ssh/id_ed25519   (paste RunPod's ssh command)
+  setup-pod-claude --help
+
+Arguments:
+  HOST    Pod SSH host (IP or hostname from RunPod UI)
+  PORT    Pod SSH port (from RunPod UI)
+
+Examples:
+  setup-pod-claude 213.173.105.80 29269
+
+Auth source (first one found wins):
+  1. \$CLAUDE_CODE_OAUTH_TOKEN   (long-lived token; create with 'claude setup-token')
+  2. \$ANTHROPIC_API_KEY
+  3. macOS Keychain 'Claude Code-credentials' (copied to /root/.claude/.credentials.json)
+
+  Prefer (1): option 3 shares a rotating refresh token with your Mac, so the
+  Mac and the pod can invalidate each other's login.
+
+What it does:
+  1. Tests SSH
+  2. Installs Claude Code via the native installer (skipped if present)
+  3. Installs the auth credential (token goes over ssh stdin, never argv)
+  4. Marks onboarding complete so 'claude' starts without prompts
+  5. Sets up GitHub (git credential helper, GH_TOKEN, git user.name/email) if a
+     token is available: \$GH_TOKEN, \$GITHUB_TOKEN, or 'gh auth token' locally
+  6. apt-get update, then installs missing monitoring tools: nvtop htop btop iotop ncdu
+     sysstat (iostat) tmux; already-installed ones are skipped,
+     and installs 'podmon' (one tmux window: nvtop + htop + disk + log tail)
+  7. Runs a headless 'claude -p' check
+
+Notes:
+  - Also runs setup-pod-gcloud at the end (gcloud + gcdn + creds). SKIP_GCLOUD=1 to omit.
+  - Safe to re-run (idempotent). If the pod already has working Claude or GitHub
+    credentials they are left alone; use FORCE=1 to overwrite them.
+  - SSH key: ~/.ssh/id_ed25519
+EOF
+  exit 0
+}
+
+[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && usage
+
+# Accept either "HOST PORT" or a full ssh command (quoted or not):
+#   setup-pod-claude ssh root@1.2.3.4 -p 22 -i ~/.ssh/id_ed25519
+KEY="${HOME}/.ssh/id_ed25519"
+USER_NAME=root
+if [[ "${1:-}" == "ssh" || "${1:-}" == *" "* ]]; then
+  args=("$@")
+  [[ ${#args[@]} -eq 1 ]] && read -r -a args <<<"${args[0]}"
+  HOST="" PORT=22
+  i=1  # skip leading "ssh"
+  while (( i < ${#args[@]} )); do
+    case "${args[i]}" in
+      -p) PORT="${args[++i]:-}" ;;
+      -i) KEY="${args[++i]:-}" ;;
+      -p*) PORT="${args[i]#-p}" ;;
+      -*) ;;  # ignore other flags
+      *@*) USER_NAME="${args[i]%@*}"; HOST="${args[i]#*@}" ;;
+      *) [[ -z "$HOST" ]] && HOST="${args[i]}" ;;
+    esac
+    i=$((i+1))
+  done
+  KEY="${KEY/#\~/$HOME}"
+  [[ -n "$HOST" ]] || { echo "FATAL: no host found in ssh command" >&2; exit 1; }
+else
+  HOST="${1:?Usage: setup-pod-claude HOST PORT | setup-pod-claude ssh root@HOST -p PORT (try --help)}"
+  PORT="${2:?Usage: setup-pod-claude HOST PORT | setup-pod-claude ssh root@HOST -p PORT (try --help)}"
+fi
+
+fail() { echo "FATAL: $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+
+[[ "$PORT" =~ ^[0-9]+$ ]] || fail "PORT must be numeric, got '$PORT'"
+(( PORT >= 1 && PORT <= 65535 )) || fail "PORT out of range: $PORT"
+[[ -r "$KEY" ]] || fail "SSH key not readable: $KEY"
+
+SSH=(ssh -p "$PORT" -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${USER_NAME}@${HOST}")
+
+# Resolve auth locally
+AUTH_MODE="" AUTH_PAYLOAD=""
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+  AUTH_MODE=oauth_token; AUTH_PAYLOAD="$CLAUDE_CODE_OAUTH_TOKEN"
+elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  AUTH_MODE=api_key; AUTH_PAYLOAD="$ANTHROPIC_API_KEY"
+elif creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) && [[ -n "$creds" ]]; then
+  AUTH_MODE=credentials; AUTH_PAYLOAD="$creds"
+elif [[ -r "$HOME/.claude/.credentials.json" ]]; then
+  AUTH_MODE=credentials; AUTH_PAYLOAD=$(<"$HOME/.claude/.credentials.json")
+else
+  fail "No Claude auth found. Run 'claude setup-token' and export CLAUDE_CODE_OAUTH_TOKEN, or log in locally with 'claude'."
+fi
+
+# GitHub creds (optional): $GH_TOKEN / $GITHUB_TOKEN, else the local gh CLI login
+GH_TOKEN_LOCAL="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [[ -z "$GH_TOKEN_LOCAL" ]] && command -v gh &>/dev/null; then
+  GH_TOKEN_LOCAL=$(gh auth token 2>/dev/null || true)
+fi
+GIT_NAME=$(git config --global user.name 2>/dev/null || true)
+GIT_EMAIL=$(git config --global user.email 2>/dev/null || true)
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+step "Testing SSH to ${HOST}:${PORT}"
+"${SSH[@]}" 'echo "SSH OK: $(hostname)"' 2>&1 || fail "Cannot SSH to ${HOST}:${PORT} — check host/port and that the pod is running"
+
+step "Installing Claude Code + auth (mode: ${AUTH_MODE})"
+# NOTE: `bash -s` reads the script from stdin, so the secret can't share stdin cleanly.
+# Instead send the secret as a single-line env assignment ahead of the script body.
+{
+  printf 'AUTH_MODE=%q\nFORCE=%q\n' "$AUTH_MODE" "${FORCE:-0}"
+  # Credentials JSON may be multi-line; base64 keeps it on one line.
+  printf 'GH_B64=%q\nGIT_NAME_B64=%q\nGIT_EMAIL_B64=%q\n' "$(b64 "$GH_TOKEN_LOCAL")" "$(b64 "$GIT_NAME")" "$(b64 "$GIT_EMAIL")"
+  printf 'PODMON_B64=%q\n' "$(base64 < "$(dirname "${BASH_SOURCE[0]}")/podmon" 2>/dev/null | tr -d '\n')"
+  printf 'AUTH_B64=%q\n' "$(printf '%s' "$AUTH_PAYLOAD" | base64 | tr -d '\n')"
+  cat <<'REMOTE'
+set -uo pipefail
+ok()   { echo "  OK: $*"; }
+warn() { echo "  WARNING: $*"; }
+step() { echo ""; echo "==> $*"; }
+fail() { echo "FATAL (remote): $*" >&2; exit 1; }
+
+export PATH="$HOME/.local/bin:$PATH"
+SECRET=$(printf '%s' "$AUTH_B64" | base64 -d)
+
+step "Claude Code"
+if command -v claude &>/dev/null; then
+  ok "already installed: $(claude --version 2>&1 | head -1)"
+else
+  if ! command -v curl &>/dev/null; then
+    apt-get update -qq </dev/null >/dev/null 2>&1 && apt-get install -y -qq curl ca-certificates </dev/null >/dev/null 2>&1
+  fi
+  curl -fsSL https://claude.ai/install.sh | bash || fail "Claude install failed — check network"
+  command -v claude &>/dev/null || fail "claude not on PATH after install"
+  ok "installed: $(claude --version 2>&1 | head -1)"
+fi
+grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+step "Auth"
+CLAUDE_READY=0
+if [[ "$FORCE" != 1 ]]; then
+  # Load a previously installed token (non-interactive shells skip ~/.bashrc)
+  eval "$(sed -n '/# >>> setup-pod-claude >>>/,/# <<< setup-pod-claude <<</p' ~/.bashrc 2>/dev/null)"
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" || -f ~/.claude/.credentials.json ]]; then
+    echo "  existing Claude credentials found — testing..."
+    if out=$(timeout 90 claude -p "Reply with exactly: pong" 2>&1 </dev/null); then
+      ok "Claude already authenticated (reply: $(echo "$out" | head -1)) — skipping update (FORCE=1 to override)"
+      CLAUDE_READY=1
+    else
+      warn "existing Claude credentials not working — replacing"
+      unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY
+    fi
+  fi
+fi
+if [[ $CLAUDE_READY != 1 ]]; then
+# Drop any previous managed block so re-runs don't stack exports
+sed -i '/# >>> setup-pod-claude >>>/,/# <<< setup-pod-claude <<</d' ~/.bashrc
+case "$AUTH_MODE" in
+  oauth_token|api_key)
+    var=CLAUDE_CODE_OAUTH_TOKEN; [[ "$AUTH_MODE" == api_key ]] && var=ANTHROPIC_API_KEY
+    {
+      echo '# >>> setup-pod-claude >>>'
+      printf 'export %s=%q\n' "$var" "$SECRET"
+      echo '# <<< setup-pod-claude <<<'
+    } >> ~/.bashrc
+    chmod 600 ~/.bashrc
+    export "$var=$SECRET"
+    ok "exported $var via ~/.bashrc"
+    ;;
+  credentials)
+    mkdir -p ~/.claude && chmod 700 ~/.claude
+    printf '%s' "$SECRET" > ~/.claude/.credentials.json
+    chmod 600 ~/.claude/.credentials.json
+    ok "wrote ~/.claude/.credentials.json"
+    ;;
+esac
+
+# Skip first-run theme/login prompts
+python3 - <<'PY' 2>/dev/null || warn "could not update ~/.claude.json (python3 missing?)"
+import json, os
+p = os.path.expanduser("~/.claude.json")
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+d["hasCompletedOnboarding"] = True
+json.dump(d, open(p, "w"))
+os.chmod(p, 0o600)
+PY
+fi
+
+step "GitHub"
+GH_SECRET=$(printf '%s' "$GH_B64" | base64 -d)
+existing_gh=$(sed -n 's#^https://[^:]*:\([^@]*\)@github.com$#\1#p' ~/.git-credentials 2>/dev/null | head -1)
+if [[ "$FORCE" != 1 && -n "$existing_gh" ]] && \
+   curl -fsS -H "Authorization: Bearer $existing_gh" https://api.github.com/user 2>/dev/null | grep -q '"login"'; then
+  ok "GitHub credentials already present and valid — skipping update (FORCE=1 to override)"
+elif [[ -z "$GH_SECRET" ]]; then
+  warn "no GitHub token supplied locally — skipping (run 'gh auth login' locally or export GH_TOKEN)"
+else
+  command -v git &>/dev/null || { apt-get update -qq </dev/null >/dev/null 2>&1; apt-get install -y -qq git </dev/null >/dev/null 2>&1; }
+  git config --global credential.helper store
+  printf 'https://x-access-token:%s@github.com\n' "$GH_SECRET" > ~/.git-credentials
+  chmod 600 ~/.git-credentials
+  n=$(printf '%s' "$GIT_NAME_B64" | base64 -d); e=$(printf '%s' "$GIT_EMAIL_B64" | base64 -d)
+  [[ -n "$n" ]] && git config --global user.name "$n"
+  [[ -n "$e" ]] && git config --global user.email "$e"
+  if ! command -v gh &>/dev/null; then
+    {
+      apt-get install -y -qq gh ||
+      {
+        # Not in the distro repos: add GitHub's official apt repo
+        mkdir -p -m 755 /etc/apt/keyrings &&
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg &&
+        chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg &&
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list &&
+        apt-get update -qq && apt-get install -y -qq gh
+      }
+    } </dev/null >/dev/null 2>&1 && ok "gh installed: $(gh --version | head -1)" || warn "gh CLI could not be installed (git over https still works)"
+  fi
+  export GH_TOKEN="$GH_SECRET"
+  sed -i '/# >>> setup-pod-claude-gh >>>/,/# <<< setup-pod-claude-gh <<</d' ~/.bashrc
+  { echo '# >>> setup-pod-claude-gh >>>'; printf 'export GH_TOKEN=%q\n' "$GH_SECRET"; echo '# <<< setup-pod-claude-gh <<<'; } >> ~/.bashrc
+  if curl -fsS -H "Authorization: Bearer $GH_SECRET" https://api.github.com/user 2>/dev/null | grep -q '"login"'; then
+    ok "GitHub token valid; git credential helper + GH_TOKEN configured"
+  else
+    warn "GitHub token configured but API check failed (token invalid or no network)"
+  fi
+fi
+
+# Route git@github.com:/ssh://git@github.com/ remotes over HTTPS so the token above covers them
+if command -v git &>/dev/null && [[ -f ~/.git-credentials ]]; then
+  git config --global --replace-all url."https://github.com/".insteadOf "git@github.com:"
+  git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+  ok "git@github.com remotes rewritten to https"
+fi
+
+step "Monitoring tools"
+# binary -> apt package; install only what's missing (one apt-get update first)
+declare -A pkg=( [nvtop]=nvtop [htop]=htop [btop]=btop [iotop]=iotop [ncdu]=ncdu [iostat]=sysstat [tmux]=tmux )
+missing=()
+for b in nvtop htop btop iotop ncdu iostat tmux; do
+  command -v "$b" &>/dev/null && ok "$b: already installed" || missing+=("$b")
+done
+if (( ${#missing[@]} )); then
+  echo "  apt-get update..."
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || warn "apt-get update failed — installs may fail"
+  for b in "${missing[@]}"; do
+    # one at a time so a package missing from this distro (e.g. btop on older Ubuntu) doesn't block the rest
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkg[$b]}" </dev/null >/dev/null 2>&1; then
+      ok "$b: installed (${pkg[$b]})"
+    else
+      warn "$b: could not install (package '${pkg[$b]}' unavailable or apt failed)"
+    fi
+  done
+fi
+
+if [[ -n "$PODMON_B64" ]]; then
+  printf '%s' "$PODMON_B64" | base64 -d > /usr/local/bin/podmon && chmod +x /usr/local/bin/podmon \
+    && ok "podmon installed — run 'podmon [LOGFILE]' for the one-window dashboard" \
+    || warn "could not install /usr/local/bin/podmon"
+else
+  warn "podmon not found next to setup-pod-claude — dashboard not installed"
+fi
+
+step "Verification"
+if [[ $CLAUDE_READY == 1 ]]; then
+  ok "claude verified above"; echo ""; echo "  All checks passed"
+elif out=$(timeout 90 claude -p "Reply with exactly: pong" 2>&1 </dev/null); then
+  ok "claude replied: $(echo "$out" | head -1)"
+  echo ""; echo "  All checks passed"
+else
+  warn "headless check failed: $(echo "$out" | head -3)"
+  warn "token may be expired — re-run after 'claude setup-token' locally"
+  exit 2
+fi
+REMOTE
+} | "${SSH[@]}" 'bash -s'
+
+rc=$?
+echo ""
+if [[ $rc -eq 0 ]]; then
+  echo "Done. Claude Code ready on ${HOST}:${PORT} — ssh in and run 'claude'"
+  # gcloud + gcdn + creds via the sibling script (bootstrap_pod.sh then skips its two interactive logins).
+  # SKIP_GCLOUD=1 to omit. setup-pod-gcloud always uses ~/.ssh/id_ed25519, so only chain it for that key.
+  if [[ "${SKIP_GCLOUD:-0}" != 1 ]]; then
+    gc="$(dirname "${BASH_SOURCE[0]}")/setup-pod-gcloud"
+    if [[ ! -x "$gc" ]]; then
+      echo "  skip gcloud: setup-pod-gcloud not found next to this script"
+    elif [[ "$KEY" != "$HOME/.ssh/id_ed25519" ]]; then
+      echo "  skip gcloud: setup-pod-gcloud only supports ~/.ssh/id_ed25519 (you passed $KEY)"
+    else
+      step "gcloud + gcdn (setup-pod-gcloud)"
+      "$gc" "$HOST" "$PORT" || { echo "FAILED: setup-pod-gcloud (exit $?)" >&2; exit 1; }
+    fi
+  fi
+else
+  echo "FAILED (exit $rc). Check errors above." >&2
+  exit $rc
+fi

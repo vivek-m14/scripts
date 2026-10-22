@@ -56,6 +56,17 @@ step() { echo ""; echo "==> $*"; }
 (( PORT >= 1 && PORT <= 65535 )) || fail "PORT out of range: $PORT"
 [[ -r "$KEY" ]] || fail "SSH key not readable: $KEY"
 
+# Local creds must be fresh: a Workspace reauth policy expires refresh tokens
+# periodically, and a pod can't do the interactive reauth.
+step "Checking local gcloud credentials are fresh"
+if ! gcloud auth application-default print-access-token &>/dev/null; then
+  fail "Local ADC token is expired — run: gcloud auth application-default login   (then re-run)"
+fi
+if ! gcloud auth print-access-token &>/dev/null; then
+  fail "Local gcloud login is expired — run: gcloud auth login   (then re-run)"
+fi
+echo "  local ADC + gcloud login OK"
+
 SSH=(ssh -p "$PORT" -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@${HOST}")
 SCP=(scp -P "$PORT" -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
@@ -118,6 +129,7 @@ else
   fi
   export PATH="$workdir/google-cloud-sdk/bin:$PATH"
   echo "export PATH=\"$workdir/google-cloud-sdk/bin:\$PATH\"" >> ~/.bashrc
+  ln -sf "$workdir/google-cloud-sdk/bin/gcloud" /usr/local/bin/gcloud   # on PATH for non-login shells (re-runs, bootstrap scripts)
   rm -f google-cloud-cli-linux-x86_64.tar.gz
   ok "installed: $(gcloud version 2>&1 | head -1)"
 fi
